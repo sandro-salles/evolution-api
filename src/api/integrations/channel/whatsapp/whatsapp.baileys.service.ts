@@ -3580,9 +3580,7 @@ export class BaileysStartupService extends ChannelStartupService {
     const participant = key?.participant ?? fallbackKey?.participant ?? null;
     const participantAlt = key?.participantAlt ?? fallbackKey?.participantAlt ?? null;
     const addressingMode =
-      key?.addressingMode ??
-      fallbackKey?.addressingMode ??
-      this.inferWebhookAddressingMode({ remoteJid, participant });
+      key?.addressingMode ?? fallbackKey?.addressingMode ?? this.inferWebhookAddressingMode({ remoteJid, participant });
 
     return {
       ...(fallbackKey || {}),
@@ -3642,13 +3640,15 @@ export class BaileysStartupService extends ChannelStartupService {
       return new Map<string, string>();
     }
 
-    const mappings = await this.client.signalRepository.lidMapping.getPNsForLIDs(lidJids);
+    const mappings = await Promise.all(
+      lidJids.map(async (lid) => {
+        const pn = await this.client.signalRepository.lidMapping.getPNForLID(lid);
 
-    return new Map(
-      (mappings || [])
-        .filter((mapping) => !!mapping.pn)
-        .map((mapping) => [this.getBaseLid(mapping.lid) || mapping.lid, mapping.pn]),
+        return pn ? ([lid, pn] as const) : null;
+      }),
     );
+
+    return new Map(mappings.filter((mapping): mapping is readonly [string, string] => !!mapping));
   }
 
   private findCachedOnWhatsappEntry(
@@ -3883,7 +3883,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
         if (cached) {
           this.logger.verbose(`Number ${user.number} found in cache`);
-          const lid = this.getBaseLid(cached.lid) || this.getBaseLid(cached.remoteJid) || resolvedLids.get(cached.remoteJid);
+          const lid =
+            this.getBaseLid(cached.lid) || this.getBaseLid(cached.remoteJid) || resolvedLids.get(cached.remoteJid);
 
           return new OnWhatsAppDto(
             cached.remoteJid,

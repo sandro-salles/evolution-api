@@ -16,6 +16,7 @@
 - Para documentar payload de webhook, seguir `sendDataWebhook -> webhook.controller -> ponto de emissão` e não assumir que o contrato é uniforme entre eventos do mesmo nome.
 - Quando um contrato externo precisa ser estabilizado sem arriscar regressão interna, normalizar o payload apenas no boundary do webhook e preservar os objetos internos usados por cache/chatbot/DB.
 - Para `contacts.update`, combinar `contact.id/lid/phoneNumber` com `getOnWhatsappCache()` e `signalRepository.lidMapping` cobre tanto eventos ricos (`contacts.upsert`) quanto updates pobres (`notify`, `picture`).
+- Para validar localmente o Evolution alinhado ao runtime do projeto, usar `source ~/.nvm/nvm.sh && nvm use 24` antes de `npm install`/`npm run build`.
 
 ## Patterns That Don't Work
 - Inferir APIs do Baileys sem abrir o código-fonte local quando há integrações específicas como `lidMapping`.
