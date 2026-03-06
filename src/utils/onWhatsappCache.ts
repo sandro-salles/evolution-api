@@ -62,12 +62,26 @@ function getAvailableNumbers(remoteJid: string) {
 interface ISaveOnWhatsappCacheParams {
   remoteJid: string;
   remoteJidAlt?: string;
-  lid?: 'lid' | undefined;
+  lid?: string | null;
 }
 
 function normalizeJid(jid: string | null | undefined): string | null {
   if (!jid) return null;
   return jid.startsWith('+') ? jid.slice(1) : jid;
+}
+
+function isLidJid(jid: string | null | undefined): jid is string {
+  return !!jid && /@(hosted\.)?lid$/.test(jid);
+}
+
+function normalizeLidJid(jid: string | null | undefined): string | null {
+  const normalizedJid = normalizeJid(jid);
+
+  if (!isLidJid(normalizedJid)) {
+    return null;
+  }
+
+  return normalizedJid.replace(/:\d+(?=@(?:hosted\.)?lid$)/, '');
 }
 
 export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
@@ -78,18 +92,28 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
   // Processa todos os itens em paralelo para melhor performance
   const processingPromises = data.map(async (item) => {
     try {
-      const remoteJid = normalizeJid(item.remoteJid);
+      const normalizedRemoteJid = normalizeJid(item.remoteJid);
+      const altJidNormalized = normalizeJid(item.remoteJidAlt);
+      const remoteJid =
+        isLidJid(normalizedRemoteJid) && altJidNormalized && !isLidJid(altJidNormalized)
+          ? altJidNormalized
+          : normalizedRemoteJid;
+
       if (!remoteJid) {
         logger.warn('[saveOnWhatsappCache] Item skipped, missing remoteJid.');
         return;
       }
 
-      const altJidNormalized = normalizeJid(item.remoteJidAlt);
-      const lidAltJid = altJidNormalized && altJidNormalized.includes('@lid') ? altJidNormalized : null;
+      const lidAltJid = normalizeLidJid(item.remoteJidAlt);
+      const newLid =
+        [item.lid, normalizedRemoteJid, altJidNormalized].map((jid) => normalizeLidJid(jid)).find(Boolean) || null;
 
       const baseJids = [remoteJid]; // Garante que o remoteJid esteja na lista inicial
       if (lidAltJid) {
         baseJids.push(lidAltJid);
+      }
+      if (newLid && !baseJids.includes(newLid)) {
+        baseJids.push(newLid);
       }
 
       const expandedJids = baseJids.flatMap((jid) => getAvailableNumbers(jid));
@@ -126,7 +150,6 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
       // Ordena os JIDs para garantir consistência na string final
       const sortedJidOptions = [...finalJidOptions].sort();
       const newJidOptionsString = sortedJidOptions.join(',');
-      const newLid = item.lid === 'lid' || item.remoteJid?.includes('@lid') ? 'lid' : null;
 
       const dataPayload = {
         remoteJid: remoteJid,

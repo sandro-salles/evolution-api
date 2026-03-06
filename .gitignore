@@ -46,3 +46,7 @@ lerna-debug.log*
 .tool-versions
 
 /prisma/migrations/*
+
+.ghcr-token
+build-docker.sh
+publish-docker.sh

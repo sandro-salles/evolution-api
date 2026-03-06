@@ -158,9 +158,30 @@ import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 export interface ExtendedIMessageKey extends proto.IMessageKey {
   remoteJidAlt?: string;
   participantAlt?: string;
+  addressingMode?: string | null;
   server_id?: string;
   isViewOnce?: boolean;
 }
+
+type NormalizedWebhookMessageKey = Omit<
+  ExtendedIMessageKey,
+  'remoteJid' | 'remoteJidAlt' | 'participant' | 'participantAlt' | 'addressingMode'
+> & {
+  remoteJid: string | null;
+  remoteJidAlt: string | null;
+  participant: string | null;
+  participantAlt: string | null;
+  addressingMode: string | null;
+};
+
+type NormalizedWebhookContact = {
+  remoteJid: string;
+  remoteJidAlt: string | null;
+  addressingMode: string | null;
+  pushName?: string;
+  profilePicUrl?: string | null;
+  instanceId: string;
+};
 
 const groupMetadataCache = new CacheService(new CacheEngine(configService, 'groups').getEngine());
 
@@ -853,12 +874,13 @@ export class BaileysStartupService extends ChannelStartupService {
         );
 
         if (updatedContacts.length > 0) {
+          const webhookUpdatedContacts = await this.normalizeWebhookContacts(updatedContacts, contacts);
           const usersContacts = updatedContacts.filter((c) => c.remoteJid.includes('@s.whatsapp'));
           if (usersContacts) {
             await saveOnWhatsappCache(usersContacts.map((c) => ({ remoteJid: c.remoteJid })));
           }
 
-          this.sendDataWebhook(Events.CONTACTS_UPDATE, updatedContacts);
+          this.sendDataWebhook(Events.CONTACTS_UPDATE, webhookUpdatedContacts);
           await Promise.all(
             updatedContacts.map(async (contact) => {
               if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
@@ -906,7 +928,9 @@ export class BaileysStartupService extends ChannelStartupService {
         });
       }
 
-      this.sendDataWebhook(Events.CONTACTS_UPDATE, contactsRaw);
+      const webhookContactsRaw = await this.normalizeWebhookContacts(contactsRaw, contacts);
+
+      this.sendDataWebhook(Events.CONTACTS_UPDATE, webhookContactsRaw);
 
       if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
         const updateTransactions = contactsRaw.map((contact) =>
@@ -1123,20 +1147,25 @@ export class BaileysStartupService extends ChannelStartupService {
             received?.message?.protocolMessage || received?.message?.editedMessage?.message?.protocolMessage;
 
           if (editedMessage) {
+            const normalizedEditedMessage = this.normalizeWebhookPayloadKey(
+              editedMessage as typeof editedMessage & { key?: ExtendedIMessageKey | null },
+              received.key as ExtendedIMessageKey,
+            );
+
             if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled)
               this.chatwootService.eventWhatsapp(
                 'messages.edit',
                 { instanceName: this.instance.name, instanceId: this.instance.id },
-                editedMessage,
+                normalizedEditedMessage,
               );
 
-            await this.sendDataWebhook(Events.MESSAGES_EDITED, editedMessage);
+            await this.sendDataWebhook(Events.MESSAGES_EDITED, normalizedEditedMessage);
 
-            if (received.key?.id && editedMessage.key?.id) {
-              await this.baileysCache.set(`protocol_${received.key.id}`, editedMessage.key.id, 60 * 60 * 24);
+            if (received.key?.id && normalizedEditedMessage.key?.id) {
+              await this.baileysCache.set(`protocol_${received.key.id}`, normalizedEditedMessage.key.id, 60 * 60 * 24);
             }
 
-            const oldMessage = await this.getMessage(editedMessage.key, true);
+            const oldMessage = await this.getMessage(normalizedEditedMessage.key, true);
             if ((oldMessage as any)?.id) {
               const editedMessageTimestamp = Long.isLong(received?.messageTimestamp)
                 ? Math.floor(received?.messageTimestamp.toNumber())
@@ -1145,16 +1174,16 @@ export class BaileysStartupService extends ChannelStartupService {
               await this.prismaRepository.message.update({
                 where: { id: (oldMessage as any).id },
                 data: {
-                  message: editedMessage.editedMessage as any,
+                  message: normalizedEditedMessage.editedMessage as any,
                   messageTimestamp: editedMessageTimestamp,
                   status: 'EDITED',
                 },
               });
               await this.prismaRepository.messageUpdate.create({
                 data: {
-                  fromMe: editedMessage.key.fromMe,
-                  keyId: editedMessage.key.id,
-                  remoteJid: editedMessage.key.remoteJid,
+                  fromMe: normalizedEditedMessage.key.fromMe,
+                  keyId: normalizedEditedMessage.key.id,
+                  remoteJid: normalizedEditedMessage.key.remoteJid,
                   status: 'EDITED',
                   instanceId: this.instanceId,
                   messageId: (oldMessage as any).id,
@@ -1475,12 +1504,13 @@ export class BaileysStartupService extends ChannelStartupService {
           this.logger.verbose(messageRaw);
 
           sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
+          const webhookMessageRaw = this.normalizeWebhookPayloadKey(messageRaw);
           if (messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt) {
             messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
           }
           console.log(messageRaw);
 
-          this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
+          this.sendDataWebhook(Events.MESSAGES_UPSERT, webhookMessageRaw);
 
           await chatbotController.emit({
             instance: { instanceName: this.instance.name, instanceId: this.instanceId },
@@ -1504,24 +1534,31 @@ export class BaileysStartupService extends ChannelStartupService {
             profilePicUrl: (await this.profilePicture(received.key.remoteJid)).profilePictureUrl,
             instanceId: this.instanceId,
           };
+          const webhookContactRaw: NormalizedWebhookContact = {
+            ...contactRaw,
+            remoteJidAlt: webhookMessageRaw.key.remoteJidAlt,
+            addressingMode: webhookMessageRaw.key.addressingMode,
+          };
 
           if (contactRaw.remoteJid === 'status@broadcast') {
             continue;
           }
 
           if (contactRaw.remoteJid.includes('@s.whatsapp') || contactRaw.remoteJid.includes('@lid')) {
+            const lidJid = [contactRaw.remoteJid, messageRaw.key.remoteJidAlt].find((jid) => jid?.includes('@lid'));
+
             await saveOnWhatsappCache([
               {
                 remoteJid:
                   messageRaw.key.addressingMode === 'lid' ? messageRaw.key.remoteJidAlt : messageRaw.key.remoteJid,
                 remoteJidAlt: messageRaw.key.remoteJidAlt,
-                lid: messageRaw.key.addressingMode === 'lid' ? 'lid' : null,
+                lid: lidJid,
               },
             ]);
           }
 
           if (contact) {
-            this.sendDataWebhook(Events.CONTACTS_UPDATE, contactRaw);
+            this.sendDataWebhook(Events.CONTACTS_UPDATE, webhookContactRaw);
 
             if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
               await this.chatwootService.eventWhatsapp(
@@ -2423,6 +2460,7 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       const messageRaw = this.prepareMessage(messageSent);
+      const webhookMessageRaw = this.normalizeWebhookPayloadKey(messageRaw, messageSent.key as ExtendedIMessageKey);
 
       const isMedia =
         messageSent?.message?.imageMessage ||
@@ -2542,7 +2580,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       this.logger.verbose(messageSent);
 
-      this.sendDataWebhook(Events.SEND_MESSAGE, messageRaw);
+      this.sendDataWebhook(Events.SEND_MESSAGE, webhookMessageRaw);
 
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled && isIntegration) {
         await chatbotController.emit({
@@ -3503,6 +3541,254 @@ export class BaileysStartupService extends ChannelStartupService {
     });
   }
 
+  private normalizeWebhookJid(jid: string | null | undefined) {
+    return jid ? jid.replace(/^\+/, '') : null;
+  }
+
+  private isLidAddress(jid: string | null | undefined) {
+    return !!jid && /@(hosted\.)?lid$/.test(jid);
+  }
+
+  private inferWebhookAddressingMode(key: Pick<NormalizedWebhookMessageKey, 'remoteJid' | 'participant'>) {
+    const primaryAddress = key.participant || key.remoteJid;
+
+    if (!primaryAddress) {
+      return null;
+    }
+
+    if (this.isLidAddress(primaryAddress)) {
+      return 'lid';
+    }
+
+    if (key.participant) {
+      return 'pn';
+    }
+
+    if (!isJidGroup(primaryAddress) && !isJidBroadcast(primaryAddress) && !isJidNewsletter(primaryAddress)) {
+      return 'pn';
+    }
+
+    return null;
+  }
+
+  private normalizeWebhookKey(
+    key?: ExtendedIMessageKey | null,
+    fallbackKey?: ExtendedIMessageKey | null,
+  ): NormalizedWebhookMessageKey {
+    const remoteJid = key?.remoteJid ?? fallbackKey?.remoteJid ?? null;
+    const remoteJidAlt = key?.remoteJidAlt ?? fallbackKey?.remoteJidAlt ?? null;
+    const participant = key?.participant ?? fallbackKey?.participant ?? null;
+    const participantAlt = key?.participantAlt ?? fallbackKey?.participantAlt ?? null;
+    const addressingMode =
+      key?.addressingMode ??
+      fallbackKey?.addressingMode ??
+      this.inferWebhookAddressingMode({ remoteJid, participant });
+
+    return {
+      ...(fallbackKey || {}),
+      ...(key || {}),
+      remoteJid,
+      remoteJidAlt,
+      participant,
+      participantAlt,
+      addressingMode,
+    };
+  }
+
+  private normalizeWebhookPayloadKey<T extends { key?: ExtendedIMessageKey | null }>(
+    payload: T,
+    fallbackKey?: ExtendedIMessageKey | null,
+  ): Omit<T, 'key'> & { key: NormalizedWebhookMessageKey } {
+    return {
+      ...payload,
+      key: this.normalizeWebhookKey(payload?.key as ExtendedIMessageKey | null, fallbackKey),
+    };
+  }
+
+  private hasResolvedLid(lid: string | null | undefined) {
+    return this.isLidAddress(lid);
+  }
+
+  private getBaseLid(lid: string | null | undefined) {
+    if (!this.hasResolvedLid(lid)) {
+      return undefined;
+    }
+
+    return lid.replace(/:\d+(?=@(?:hosted\.)?lid$)/, '');
+  }
+
+  private async resolveLidsForPhoneJids(jids: string[]): Promise<Map<string, string>> {
+    const phoneJids = [...new Set(jids.filter((jid) => isPnUser(jid)))];
+
+    if (!phoneJids.length) {
+      return new Map<string, string>();
+    }
+
+    const mappings = await this.client.signalRepository.lidMapping.getLIDsForPNs(phoneJids);
+
+    return new Map(
+      (mappings || [])
+        .filter((mapping) => !!mapping.lid)
+        .map((mapping) => [mapping.pn, this.getBaseLid(mapping.lid) as string]),
+    );
+  }
+
+  private async resolvePhoneJidsForLids(jids: string[]): Promise<Map<string, string>> {
+    const lidJids = [
+      ...new Set(jids.map((jid) => this.getBaseLid(jid) || jid).filter((jid) => this.hasResolvedLid(jid))),
+    ] as string[];
+
+    if (!lidJids.length) {
+      return new Map<string, string>();
+    }
+
+    const mappings = await this.client.signalRepository.lidMapping.getPNsForLIDs(lidJids);
+
+    return new Map(
+      (mappings || [])
+        .filter((mapping) => !!mapping.pn)
+        .map((mapping) => [this.getBaseLid(mapping.lid) || mapping.lid, mapping.pn]),
+    );
+  }
+
+  private findCachedOnWhatsappEntry(
+    cachedNumbers: Awaited<ReturnType<typeof getOnWhatsappCache>>,
+    jid: string | null | undefined,
+  ) {
+    const normalizedJid = this.normalizeWebhookJid(jid);
+
+    if (!normalizedJid) {
+      return undefined;
+    }
+
+    const baseLid = this.getBaseLid(normalizedJid);
+
+    return cachedNumbers.find((cached) => {
+      const cachedRemoteJid = this.normalizeWebhookJid(cached.remoteJid);
+      const cachedLid = this.getBaseLid(cached.lid);
+
+      return (
+        cached.jidOptions.includes(normalizedJid) ||
+        cachedRemoteJid === normalizedJid ||
+        (!!baseLid && cachedLid === baseLid)
+      );
+    });
+  }
+
+  private getExplicitWebhookContactAlt(remoteJid: string, contact?: Partial<Contact> | null) {
+    if (!contact) {
+      return null;
+    }
+
+    if (this.isLidAddress(remoteJid)) {
+      return this.normalizeWebhookJid(contact.phoneNumber);
+    }
+
+    return this.getBaseLid(contact.lid) || null;
+  }
+
+  private async normalizeWebhookContacts(
+    contacts: { remoteJid: string; pushName?: string; profilePicUrl?: string | null; instanceId: string }[],
+    contactHints: Array<Partial<Contact> | null | undefined> = [],
+  ): Promise<NormalizedWebhookContact[]> {
+    const remoteJids = contacts
+      .map((contact) => this.normalizeWebhookJid(contact.remoteJid))
+      .filter((jid): jid is string => !!jid);
+
+    const cachedNumbers = remoteJids.length ? await getOnWhatsappCache(remoteJids) : [];
+    const phoneJidsToResolve = new Set<string>();
+    const lidJidsToResolve = new Set<string>();
+
+    contacts.forEach((contact, index) => {
+      const remoteJid = this.normalizeWebhookJid(contact.remoteJid);
+
+      if (!remoteJid || this.getExplicitWebhookContactAlt(remoteJid, contactHints[index])) {
+        return;
+      }
+
+      if (this.isLidAddress(remoteJid)) {
+        lidJidsToResolve.add(this.getBaseLid(remoteJid) || remoteJid);
+        return;
+      }
+
+      if (isPnUser(remoteJid)) {
+        phoneJidsToResolve.add(remoteJid);
+      }
+    });
+
+    const [resolvedLids, resolvedPhoneJids] = await Promise.all([
+      this.resolveLidsForPhoneJids([...phoneJidsToResolve]),
+      this.resolvePhoneJidsForLids([...lidJidsToResolve]),
+    ]);
+
+    return contacts.map((contact, index) => {
+      const remoteJid = this.normalizeWebhookJid(contact.remoteJid) || contact.remoteJid;
+      const explicitAlt = this.getExplicitWebhookContactAlt(remoteJid, contactHints[index]);
+      const cachedEntry = this.findCachedOnWhatsappEntry(cachedNumbers, remoteJid);
+      const remoteJidAlt =
+        explicitAlt ||
+        (this.isLidAddress(remoteJid)
+          ? this.normalizeWebhookJid(cachedEntry?.remoteJid) ||
+            resolvedPhoneJids.get(this.getBaseLid(remoteJid) || remoteJid) ||
+            null
+          : this.getBaseLid(cachedEntry?.lid) || resolvedLids.get(remoteJid) || null);
+
+      return {
+        ...contact,
+        remoteJid,
+        remoteJidAlt,
+        addressingMode: this.inferWebhookAddressingMode({ remoteJid, participant: null }),
+      };
+    });
+  }
+
+  private getVerifiedUser(user: { number: string; jid: string }, verify: { jid: string; exists: boolean }[]) {
+    let numberVerified: (typeof verify)[0] | null = null;
+
+    // Brazilian numbers
+    if (user.number.startsWith('55')) {
+      const numberWithDigit =
+        user.number.slice(4, 5) === '9' && user.number.length === 13
+          ? user.number
+          : `${user.number.slice(0, 4)}9${user.number.slice(4)}`;
+      const numberWithoutDigit =
+        user.number.length === 12 ? user.number : user.number.slice(0, 4) + user.number.slice(5);
+
+      numberVerified = verify.find(
+        (v) => v.jid === `${numberWithDigit}@s.whatsapp.net` || v.jid === `${numberWithoutDigit}@s.whatsapp.net`,
+      );
+    }
+
+    // Mexican/Argentina numbers
+    // Ref: https://faq.whatsapp.com/1294841057948784
+    if (!numberVerified && (user.number.startsWith('52') || user.number.startsWith('54'))) {
+      let prefix = '';
+      if (user.number.startsWith('52')) {
+        prefix = '1';
+      }
+      if (user.number.startsWith('54')) {
+        prefix = '9';
+      }
+
+      const numberWithDigit =
+        user.number.slice(2, 3) === prefix && user.number.length === 13
+          ? user.number
+          : `${user.number.slice(0, 2)}${prefix}${user.number.slice(2)}`;
+      const numberWithoutDigit =
+        user.number.length === 12 ? user.number : user.number.slice(0, 2) + user.number.slice(3);
+
+      numberVerified = verify.find(
+        (v) => v.jid === `${numberWithDigit}@s.whatsapp.net` || v.jid === `${numberWithoutDigit}@s.whatsapp.net`,
+      );
+    }
+
+    if (!numberVerified) {
+      numberVerified = verify.find((v) => v.jid === user.jid);
+    }
+
+    return numberVerified;
+  }
+
   // Chat Controller
   public async whatsappNumber(data: WhatsAppNumberDto) {
     const jids: {
@@ -3566,6 +3852,30 @@ export class BaileysStartupService extends ChannelStartupService {
       verify = await this.client.onWhatsApp(...normalNumbersNotInCache);
     }
 
+    const phoneJidsToResolveLid = new Set<string>();
+
+    jids.users.forEach((user) => {
+      const cached = cachedNumbers.find((cached) => cached.jidOptions.includes(user.jid.replace('+', '')));
+
+      if (cached) {
+        if (!this.hasResolvedLid(cached.lid) && isPnUser(cached.remoteJid)) {
+          phoneJidsToResolveLid.add(cached.remoteJid);
+        }
+        return;
+      }
+
+      if (user.jid.includes('@lid')) {
+        return;
+      }
+
+      const numberVerified = this.getVerifiedUser(user, verify);
+      if (numberVerified?.exists && isPnUser(numberVerified.jid)) {
+        phoneJidsToResolveLid.add(numberVerified.jid);
+      }
+    });
+
+    const resolvedLids = await this.resolveLidsForPhoneJids([...phoneJidsToResolveLid]);
+
     const verifiedUsers = await Promise.all(
       jids.users.map(async (user) => {
         // Try to get from cache first (works for all: normal and LID)
@@ -3573,12 +3883,14 @@ export class BaileysStartupService extends ChannelStartupService {
 
         if (cached) {
           this.logger.verbose(`Number ${user.number} found in cache`);
+          const lid = this.getBaseLid(cached.lid) || this.getBaseLid(cached.remoteJid) || resolvedLids.get(cached.remoteJid);
+
           return new OnWhatsAppDto(
             cached.remoteJid,
             true,
             user.number,
             contacts.find((c) => c.remoteJid === cached.remoteJid)?.pushName,
-            cached.lid || (cached.remoteJid.includes('@lid') ? 'lid' : undefined),
+            lid,
           );
         }
 
@@ -3589,62 +3901,22 @@ export class BaileysStartupService extends ChannelStartupService {
             true,
             user.number,
             contacts.find((c) => c.remoteJid === user.jid)?.pushName,
-            'lid',
+            this.getBaseLid(user.jid),
           );
         }
 
         // If not in cache and is a normal number, use Baileys verification
-        let numberVerified: (typeof verify)[0] | null = null;
-
-        // Brazilian numbers
-        if (user.number.startsWith('55')) {
-          const numberWithDigit =
-            user.number.slice(4, 5) === '9' && user.number.length === 13
-              ? user.number
-              : `${user.number.slice(0, 4)}9${user.number.slice(4)}`;
-          const numberWithoutDigit =
-            user.number.length === 12 ? user.number : user.number.slice(0, 4) + user.number.slice(5);
-
-          numberVerified = verify.find(
-            (v) => v.jid === `${numberWithDigit}@s.whatsapp.net` || v.jid === `${numberWithoutDigit}@s.whatsapp.net`,
-          );
-        }
-
-        // Mexican/Argentina numbers
-        // Ref: https://faq.whatsapp.com/1294841057948784
-        if (!numberVerified && (user.number.startsWith('52') || user.number.startsWith('54'))) {
-          let prefix = '';
-          if (user.number.startsWith('52')) {
-            prefix = '1';
-          }
-          if (user.number.startsWith('54')) {
-            prefix = '9';
-          }
-
-          const numberWithDigit =
-            user.number.slice(2, 3) === prefix && user.number.length === 13
-              ? user.number
-              : `${user.number.slice(0, 2)}${prefix}${user.number.slice(2)}`;
-          const numberWithoutDigit =
-            user.number.length === 12 ? user.number : user.number.slice(0, 2) + user.number.slice(3);
-
-          numberVerified = verify.find(
-            (v) => v.jid === `${numberWithDigit}@s.whatsapp.net` || v.jid === `${numberWithoutDigit}@s.whatsapp.net`,
-          );
-        }
-
-        if (!numberVerified) {
-          numberVerified = verify.find((v) => v.jid === user.jid);
-        }
+        const numberVerified = this.getVerifiedUser(user, verify);
 
         const numberJid = numberVerified?.jid || user.jid;
+        const lid = this.getBaseLid(numberJid) || resolvedLids.get(numberJid);
 
         return new OnWhatsAppDto(
           numberJid,
           !!numberVerified?.exists,
           user.number,
           contacts.find((c) => c.remoteJid === numberJid)?.pushName,
-          undefined,
+          lid,
         );
       }),
     );
@@ -3657,7 +3929,8 @@ export class BaileysStartupService extends ChannelStartupService {
       if (!user.exists) return false;
       // Verifica se estava no cache usando jidOptions
       const cached = cachedNumbers?.find((cached) => cached.jidOptions.includes(user.jid.replace('+', '')));
-      return !cached;
+      const cachedHasLid = this.hasResolvedLid(cached?.lid) || this.hasResolvedLid(cached?.remoteJid);
+      return !cached || (!!user.lid && !cachedHasLid);
     });
 
     if (numbersToCache.length > 0) {
@@ -3665,7 +3938,8 @@ export class BaileysStartupService extends ChannelStartupService {
       await saveOnWhatsappCache(
         numbersToCache.map((user) => ({
           remoteJid: user.jid,
-          lid: user.lid === 'lid' ? 'lid' : undefined,
+          remoteJidAlt: user.lid,
+          lid: user.lid,
         })),
       );
     }
@@ -4185,12 +4459,17 @@ export class BaileysStartupService extends ChannelStartupService {
           messageSent?.message?.protocolMessage || messageSent?.message?.editedMessage?.message?.protocolMessage;
 
         if (editedMessage) {
-          this.sendDataWebhook(Events.SEND_MESSAGE_UPDATE, editedMessage);
+          const normalizedEditedMessage = this.normalizeWebhookPayloadKey(
+            editedMessage as typeof editedMessage & { key?: ExtendedIMessageKey | null },
+            ((oldMessage?.key as ExtendedIMessageKey) || data.key) as ExtendedIMessageKey,
+          );
+
+          this.sendDataWebhook(Events.SEND_MESSAGE_UPDATE, normalizedEditedMessage);
           if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled)
             this.chatwootService.eventWhatsapp(
               'send.message.update',
               { instanceName: this.instance.name, instanceId: this.instance.id },
-              editedMessage,
+              normalizedEditedMessage,
             );
 
           const messageId = messageSent.message?.protocolMessage?.key?.id;
@@ -4827,7 +5106,14 @@ export class BaileysStartupService extends ChannelStartupService {
   public async baileysOnWhatsapp(jid: string) {
     const response = await this.client.onWhatsApp(jid);
 
-    return response;
+    const resolvedLids = await this.resolveLidsForPhoneJids(
+      response.filter((contact) => contact.exists && isPnUser(contact.jid)).map((contact) => contact.jid),
+    );
+
+    return response.map((contact) => ({
+      ...contact,
+      lid: this.getBaseLid(contact.jid) || resolvedLids.get(contact.jid),
+    }));
   }
 
   public async baileysProfilePictureUrl(jid: string, type: 'image' | 'preview', timeoutMs: number) {
