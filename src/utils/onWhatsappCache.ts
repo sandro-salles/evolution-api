@@ -67,7 +67,10 @@ interface ISaveOnWhatsappCacheParams {
 
 function normalizeJid(jid: string | null | undefined): string | null {
   if (!jid) return null;
-  return jid.startsWith('+') ? jid.slice(1) : jid;
+
+  const normalizedJid = jid.startsWith('+') ? jid.slice(1) : jid;
+
+  return normalizedJid.replace(/:\d+(?=@(?:s\.whatsapp\.net|g\.us|broadcast|newsletter|(?:hosted\.)?lid)$)/, '');
 }
 
 function isLidJid(jid: string | null | undefined): jid is string {

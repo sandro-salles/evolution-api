@@ -16,6 +16,8 @@
 - Para documentar payload de webhook, seguir `sendDataWebhook -> webhook.controller -> ponto de emissão` e não assumir que o contrato é uniforme entre eventos do mesmo nome.
 - Quando um contrato externo precisa ser estabilizado sem arriscar regressão interna, normalizar o payload apenas no boundary do webhook e preservar os objetos internos usados por cache/chatbot/DB.
 - Para `contacts.update`, combinar `contact.id/lid/phoneNumber` com `getOnWhatsappCache()` e `signalRepository.lidMapping` cobre tanto eventos ricos (`contacts.upsert`) quanto updates pobres (`notify`, `picture`).
+- Ao normalizar `remoteJidAlt`, sempre comparar o par final normalizado; se `remoteJidAlt === remoteJid`, zerar o alt e recalcular `addressingMode` a partir do endereço primário final.
+- O cache `IsOnWhatsapp` também precisa receber JIDs sem `:device` e, para entradas em `@lid`, vale tentar resolver PN antes de persistir; caso contrário o registro fica redundante e pouco útil para lookup futuro.
 - Para validar localmente o Evolution alinhado ao runtime do projeto, usar `source ~/.nvm/nvm.sh && nvm use 24` antes de `npm install`/`npm run build`.
 
 ## Patterns That Don't Work
