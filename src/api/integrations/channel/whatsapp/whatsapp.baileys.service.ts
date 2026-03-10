@@ -272,6 +272,9 @@ export class BaileysStartupService extends ChannelStartupService {
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
+  private readonly logBaileysEvents = process.env.LOG_BAILEYS_EVENTS === 'true';
+  private readonly logBaileysRaw = process.env.LOG_BAILEYS_RAW === 'true';
+  private pendingBaileysEventBatches = 0;
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
@@ -283,6 +286,109 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public get connectionStatus() {
     return this.stateConnection;
+  }
+
+  private summarizeEventPayload(payload: unknown) {
+    if (Array.isArray(payload)) {
+      return { count: payload.length };
+    }
+
+    if (payload && typeof payload === 'object') {
+      return { keys: Object.keys(payload as Record<string, unknown>) };
+    }
+
+    return { value: payload };
+  }
+
+  private summarizeBaileysEvents(events: Record<string, any>) {
+    const summary: Record<string, unknown> = { eventNames: Object.keys(events) };
+
+    if (events['messages.upsert']) {
+      const payload = events['messages.upsert'];
+      summary['messages.upsert'] = {
+        type: payload.type,
+        count: payload.messages?.length ?? 0,
+        ids: (payload.messages ?? []).slice(0, 3).map((message) => message?.key?.id),
+        remoteJids: [
+          ...new Set(
+            (payload.messages ?? [])
+              .slice(0, 3)
+              .map((message) => message?.key?.remoteJid)
+              .filter(Boolean),
+          ),
+        ],
+      };
+    }
+
+    if (events['messages.update']) {
+      const payload = events['messages.update'];
+      summary['messages.update'] = {
+        count: payload.length,
+        ids: payload.slice(0, 3).map((message) => message?.key?.id),
+        remoteJids: [
+          ...new Set(
+            payload
+              .slice(0, 3)
+              .map((message) => message?.key?.remoteJid)
+              .filter(Boolean),
+          ),
+        ],
+        statuses: payload.slice(0, 3).map((message) => message?.update?.status),
+      };
+    }
+
+    if (events['message-receipt.update']) {
+      summary['message-receipt.update'] = this.summarizeEventPayload(events['message-receipt.update']);
+    }
+
+    if (events['connection.update']) {
+      const payload = events['connection.update'];
+      summary['connection.update'] = {
+        connection: payload.connection,
+        receivedPendingNotifications: payload.receivedPendingNotifications,
+        hasQr: Boolean(payload.qr),
+      };
+    }
+
+    return summary;
+  }
+
+  private summarizeBaileysNode(packet: any) {
+    return {
+      tag: packet?.tag,
+      attrs: {
+        id: packet?.attrs?.id,
+        from: packet?.attrs?.from,
+        class: packet?.attrs?.class,
+        type: packet?.attrs?.type,
+        participant: packet?.attrs?.participant,
+        t: packet?.attrs?.t,
+      },
+    };
+  }
+
+  private installBaileysDebugListeners() {
+    if (!this.logBaileysRaw) {
+      return;
+    }
+
+    const rawEvents = [
+      'CB:message',
+      'CB:receipt',
+      'CB:notification',
+      'CB:ack,class:message',
+      'CB:ib,,offline',
+    ] as const;
+
+    for (const eventName of rawEvents) {
+      this.client.ws.on(eventName, (packet) => {
+        this.logger.debug({
+          eventName,
+          instance: this.instance.name,
+          raw: this.summarizeBaileysNode(packet),
+        });
+      });
+    }
   }
 
   public async logoutInstance() {
@@ -723,6 +829,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     this.eventHandler();
+    this.installBaileysDebugListeners();
 
     this.client.ws.on('CB:call', (packet) => {
       console.log('CB:call', packet);
@@ -1929,8 +2036,32 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private eventHandler() {
     this.client.ev.process(async (events) => {
+      const batchReceivedAt = Date.now();
+      const queueDepthBeforeEnqueue = this.pendingBaileysEventBatches;
+      const batchSummary = this.logBaileysEvents ? this.summarizeBaileysEvents(events) : undefined;
+
+      if (this.logBaileysEvents) {
+        this.logger.debug({
+          instance: this.instance.name,
+          queueDepthBeforeEnqueue,
+          batchSummary,
+        });
+      }
+
+      this.pendingBaileysEventBatches += 1;
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
+        const processingStartedAt = Date.now();
+
         try {
+          if (this.logBaileysEvents) {
+            this.logger.debug({
+              instance: this.instance.name,
+              queueDepthAtStart: this.pendingBaileysEventBatches,
+              queueDelayMs: processingStartedAt - batchReceivedAt,
+              batchSummary,
+            });
+          }
+
           if (!this.endSession) {
             const database = this.configService.get<Database>('DATABASE');
             const settings = await this.findSettings();
@@ -2061,7 +2192,29 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
         } catch (error) {
+          if (this.logBaileysEvents) {
+            this.logger.error({
+              instance: this.instance.name,
+              queueDelayMs: processingStartedAt - batchReceivedAt,
+              processingTimeMs: Date.now() - processingStartedAt,
+              batchSummary,
+              error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
+            });
+          }
+
           this.logger.error(error);
+        } finally {
+          if (this.logBaileysEvents) {
+            this.logger.debug({
+              instance: this.instance.name,
+              queueDelayMs: processingStartedAt - batchReceivedAt,
+              processingTimeMs: Date.now() - processingStartedAt,
+              queueDepthAfterProcessing: Math.max(this.pendingBaileysEventBatches - 1, 0),
+              batchSummary,
+            });
+          }
+
+          this.pendingBaileysEventBatches = Math.max(this.pendingBaileysEventBatches - 1, 0);
         }
       });
     });

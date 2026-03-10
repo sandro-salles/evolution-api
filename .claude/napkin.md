@@ -19,6 +19,7 @@
 - Ao normalizar `remoteJidAlt`, sempre comparar o par final normalizado; se `remoteJidAlt === remoteJid`, zerar o alt e recalcular `addressingMode` a partir do endereço primário final.
 - O cache `IsOnWhatsapp` também precisa receber JIDs sem `:device` e, para entradas em `@lid`, vale tentar resolver PN antes de persistir; caso contrário o registro fica redundante e pouco útil para lookup futuro.
 - Para validar localmente o Evolution alinhado ao runtime do projeto, usar `source ~/.nvm/nvm.sh && nvm use 24` antes de `npm install`/`npm run build`.
+- Quando houver delay em `messages.upsert`/`messages.update`, vale distinguir starvation por `status@broadcast` de lentidão real do handler: ignorar `status@broadcast` no Baileys e medir `queueDelayMs` no `ev.process()` ajuda a separar as duas causas.
 
 ## Patterns That Don't Work
 - Inferir APIs do Baileys sem abrir o código-fonte local quando há integrações específicas como `lidMapping`.
