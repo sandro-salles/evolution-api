@@ -12,7 +12,7 @@ import { Events, wa } from '@api/types/wa.types';
 import { Auth, Chatwoot, ConfigService, HttpServer, Proxy } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { NotFoundException } from '@exceptions';
-import { Contact, Message, Prisma } from '@prisma/client';
+import { Contact, Message, Prisma, Setting } from '@prisma/client';
 import { createJid } from '@utils/createJid';
 import { WASocket } from 'baileys';
 import { isArray } from 'class-validator';
@@ -20,6 +20,18 @@ import EventEmitter2 from 'eventemitter2';
 import { v4 } from 'uuid';
 
 import { CacheService } from './cache.service';
+
+type ChannelSettingsSnapshot = Pick<
+  wa.LocalSettings,
+  | 'rejectCall'
+  | 'msgCall'
+  | 'groupsIgnore'
+  | 'alwaysOnline'
+  | 'readMessages'
+  | 'readStatus'
+  | 'syncFullHistory'
+  | 'wavoipToken'
+>;
 
 export class ChannelStartupService {
   constructor(
@@ -37,6 +49,10 @@ export class ChannelStartupService {
   public readonly localProxy: wa.LocalProxy = {};
   public readonly localSettings: wa.LocalSettings = {};
   public readonly localWebhook: wa.LocalWebHook = {};
+  private readonly SETTINGS_CACHE_TTL_MS = 2_000;
+  private settingsCachePrimed = false;
+  private settingsCacheFetchedAt = 0;
+  private settingsCacheValue: ChannelSettingsSnapshot | null = null;
 
   public chatwootService = new ChatwootService(
     waMonitor,
@@ -50,6 +66,42 @@ export class ChannelStartupService {
   public typebotService = new TypebotService(waMonitor, this.configService, this.prismaRepository, this.openaiService);
 
   public difyService = new DifyService(waMonitor, this.prismaRepository, this.configService, this.openaiService);
+
+  private toSettingsSnapshot(data?: Partial<Setting> | ChannelSettingsSnapshot | null): ChannelSettingsSnapshot | null {
+    if (!data) {
+      return null;
+    }
+
+    return {
+      rejectCall: data.rejectCall,
+      msgCall: data.msgCall,
+      groupsIgnore: data.groupsIgnore,
+      alwaysOnline: data.alwaysOnline,
+      readMessages: data.readMessages,
+      readStatus: data.readStatus,
+      syncFullHistory: data.syncFullHistory,
+      wavoipToken: data.wavoipToken,
+    };
+  }
+
+  private syncSettingsCache(data?: Partial<Setting> | ChannelSettingsSnapshot | null) {
+    const snapshot = this.toSettingsSnapshot(data);
+
+    this.localSettings.rejectCall = snapshot?.rejectCall;
+    this.localSettings.msgCall = snapshot?.msgCall;
+    this.localSettings.groupsIgnore = snapshot?.groupsIgnore;
+    this.localSettings.alwaysOnline = snapshot?.alwaysOnline;
+    this.localSettings.readMessages = snapshot?.readMessages;
+    this.localSettings.readStatus = snapshot?.readStatus;
+    this.localSettings.syncFullHistory = snapshot?.syncFullHistory;
+    this.localSettings.wavoipToken = snapshot?.wavoipToken;
+
+    this.settingsCacheValue = snapshot;
+    this.settingsCacheFetchedAt = Date.now();
+    this.settingsCachePrimed = true;
+
+    return snapshot;
+  }
 
   public setInstance(instance: InstanceDto) {
     this.logger.setInstance(instance.instanceName);
@@ -146,14 +198,7 @@ export class ChannelStartupService {
       },
     });
 
-    this.localSettings.rejectCall = data?.rejectCall;
-    this.localSettings.msgCall = data?.msgCall;
-    this.localSettings.groupsIgnore = data?.groupsIgnore;
-    this.localSettings.alwaysOnline = data?.alwaysOnline;
-    this.localSettings.readMessages = data?.readMessages;
-    this.localSettings.readStatus = data?.readStatus;
-    this.localSettings.syncFullHistory = data?.syncFullHistory;
-    this.localSettings.wavoipToken = data?.wavoipToken;
+    this.syncSettingsCache(data);
   }
 
   public async setSettings(data: SettingsDto) {
@@ -184,14 +229,7 @@ export class ChannelStartupService {
       },
     });
 
-    this.localSettings.rejectCall = data?.rejectCall;
-    this.localSettings.msgCall = data?.msgCall;
-    this.localSettings.groupsIgnore = data?.groupsIgnore;
-    this.localSettings.alwaysOnline = data?.alwaysOnline;
-    this.localSettings.readMessages = data?.readMessages;
-    this.localSettings.readStatus = data?.readStatus;
-    this.localSettings.syncFullHistory = data?.syncFullHistory;
-    this.localSettings.wavoipToken = data?.wavoipToken;
+    this.syncSettingsCache(data);
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       this.client.ws.close();
@@ -200,26 +238,19 @@ export class ChannelStartupService {
   }
 
   public async findSettings() {
+    if (this.settingsCachePrimed && Date.now() - this.settingsCacheFetchedAt < this.SETTINGS_CACHE_TTL_MS) {
+      return this.settingsCacheValue ? { ...this.settingsCacheValue } : null;
+    }
+
     const data = await this.prismaRepository.setting.findUnique({
       where: {
         instanceId: this.instanceId,
       },
     });
 
-    if (!data) {
-      return null;
-    }
+    const snapshot = this.syncSettingsCache(data);
 
-    return {
-      rejectCall: data.rejectCall,
-      msgCall: data.msgCall,
-      groupsIgnore: data.groupsIgnore,
-      alwaysOnline: data.alwaysOnline,
-      readMessages: data.readMessages,
-      readStatus: data.readStatus,
-      syncFullHistory: data.syncFullHistory,
-      wavoipToken: data.wavoipToken,
-    };
+    return snapshot ? { ...snapshot } : null;
   }
 
   public async loadChatwoot() {

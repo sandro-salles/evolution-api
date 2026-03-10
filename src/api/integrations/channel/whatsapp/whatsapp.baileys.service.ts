@@ -183,6 +183,13 @@ type NormalizedWebhookContact = {
   instanceId: string;
 };
 
+type ContactWebhookPayload = {
+  remoteJid: string;
+  pushName?: string;
+  profilePicUrl?: string | null;
+  instanceId: string;
+};
+
 const groupMetadataCache = new CacheService(new CacheEngine(configService, 'groups').getEngine());
 
 // Adicione a função getVideoDuration no início do arquivo
@@ -269,11 +276,13 @@ export class BaileysStartupService extends ChannelStartupService {
   private authStateProvider: AuthStateProvider;
   private readonly msgRetryCounterCache: CacheStore = new NodeCache();
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
+  private readonly profilePictureCache = new NodeCache({ stdTTL: 5 * 60, useClones: false });
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
   private readonly logBaileysEvents = process.env.LOG_BAILEYS_EVENTS === 'true';
   private readonly logBaileysRaw = process.env.LOG_BAILEYS_RAW === 'true';
+  private readonly ignoreStatusBroadcast = process.env.IGNORE_STATUS_BROADCAST !== 'false';
   private pendingBaileysEventBatches = 0;
 
   // Cache TTL constants (in seconds)
@@ -783,6 +792,7 @@ export class BaileysStartupService extends ChannelStartupService {
       keepAliveIntervalMs: 30_000,
       qrTimeout: 45_000,
       emitOwnEvents: false,
+      ignoreStatusBroadcast: this.ignoreStatusBroadcast,
       shouldIgnoreJid: (jid) => {
         if (this.localSettings.syncFullHistory && isJidGroup(jid)) {
           return false;
@@ -832,13 +842,13 @@ export class BaileysStartupService extends ChannelStartupService {
     this.installBaileysDebugListeners();
 
     this.client.ws.on('CB:call', (packet) => {
-      console.log('CB:call', packet);
+      this.logger.debug('CB:call packet received');
       const payload = { event: 'CB:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
     });
 
     this.client.ws.on('CB:ack,class:call', (packet) => {
-      console.log('CB:ack,class:call', packet);
+      this.logger.debug('CB:ack,class:call packet received');
       const payload = { event: 'CB:ack,class:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
     });
@@ -971,13 +981,26 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
 
+        const storedProfilePictures = await this.getStoredProfilePictureMap(contacts.map((contact) => contact.id));
+
         const updatedContacts = await Promise.all(
-          contacts.map(async (contact) => ({
-            remoteJid: contact.id,
-            pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
-            profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
-            instanceId: this.instanceId,
-          })),
+          contacts.map(async (contact) => {
+            const hasExplicitProfilePicUrl = Object.prototype.hasOwnProperty.call(contact, 'imgUrl');
+            const explicitProfilePicUrl = hasExplicitProfilePicUrl
+              ? (((contact as any).imgUrl as string) ?? null)
+              : undefined;
+
+            return {
+              remoteJid: contact.id,
+              pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
+              profilePicUrl: await this.resolveProfilePictureUrl(
+                contact.id,
+                explicitProfilePicUrl ?? storedProfilePictures.get(createJid(contact.id)),
+                !hasExplicitProfilePicUrl,
+              ),
+              instanceId: this.instanceId,
+            };
+          }),
         );
 
         if (updatedContacts.length > 0) {
@@ -1018,22 +1041,43 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
       } catch (error) {
-        console.error(error);
+        this.logger.error(error);
         this.logger.error(`Error: ${error.message}`);
       }
     },
 
     'contacts.update': async (contacts: Partial<Contact>[]) => {
-      const contactsRaw: { remoteJid: string; pushName?: string; profilePicUrl?: string; instanceId: string }[] = [];
-      for await (const contact of contacts) {
-        this.logger.debug(`Updating contact: ${JSON.stringify(contact, null, 2)}`);
-        contactsRaw.push({
-          remoteJid: contact.id,
-          pushName: contact?.name ?? contact?.verifiedName,
-          profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
-          instanceId: this.instanceId,
-        });
-      }
+      const storedProfilePictures = await this.getStoredProfilePictureMap(
+        contacts.map((contact) => contact.id).filter((contactId): contactId is string => !!contactId),
+      );
+
+      const contactsRaw = (
+        await Promise.all(
+          contacts.map(async (contact) => {
+            if (!contact.id) {
+              return null;
+            }
+
+            this.logger.debug(`Updating contact: ${JSON.stringify(contact, null, 2)}`);
+
+            const hasExplicitProfilePicUrl = Object.prototype.hasOwnProperty.call(contact, 'imgUrl');
+            const explicitProfilePicUrl = hasExplicitProfilePicUrl
+              ? (((contact as any).imgUrl as string) ?? null)
+              : undefined;
+
+            return {
+              remoteJid: contact.id,
+              pushName: contact?.name ?? contact?.verifiedName,
+              profilePicUrl: await this.resolveProfilePictureUrl(
+                contact.id,
+                explicitProfilePicUrl ?? storedProfilePictures.get(createJid(contact.id)),
+                !hasExplicitProfilePicUrl,
+              ),
+              instanceId: this.instanceId,
+            } satisfies ContactWebhookPayload;
+          }),
+        )
+      ).filter(Boolean) as ContactWebhookPayload[];
 
       const webhookContactsRaw = await this.normalizeWebhookContacts(contactsRaw, contacts);
 
@@ -1072,9 +1116,9 @@ export class BaileysStartupService extends ChannelStartupService {
     }) => {
       try {
         if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
-          console.log('received on-demand history sync, messages=', messages);
+          this.logger.debug(`received on-demand history sync with ${messages.length} messages`);
         }
-        console.log(
+        this.logger.debug(
           `recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`,
         );
 
@@ -1239,14 +1283,14 @@ export class BaileysStartupService extends ChannelStartupService {
             if (text == 'requestPlaceholder' && !requestId) {
               const messageId = await this.client.requestPlaceholderResend(received.key);
 
-              console.log('requested placeholder resync, id=', messageId);
+              this.logger.debug(`requested placeholder resync, id=${messageId}`);
             } else if (requestId) {
-              console.log('Message received from phone, id=', requestId, received);
+              this.logger.debug(`message received from phone, id=${requestId}`);
             }
 
             if (text == 'onDemandHistSync') {
               const messageId = await this.client.fetchMessageHistory(50, received.key, received.messageTimestamp!);
-              console.log('requested on-demand sync, id=', messageId);
+              this.logger.debug(`requested on-demand sync, id=${messageId}`);
             }
           }
 
@@ -1332,7 +1376,7 @@ export class BaileysStartupService extends ChannelStartupService {
                   data: { name: received.pushName },
                 });
               } catch {
-                console.log(`Chat insert record ignored: ${received.key.remoteJid} - ${this.instanceId}`);
+                this.logger.debug(`Chat insert record ignored: ${received.key.remoteJid} - ${this.instanceId}`);
               }
             }
           }
@@ -1615,7 +1659,6 @@ export class BaileysStartupService extends ChannelStartupService {
           if (messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt) {
             messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
           }
-          console.log(messageRaw);
 
           this.sendDataWebhook(Events.MESSAGES_UPSERT, webhookMessageRaw);
 
@@ -1628,6 +1671,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
           const contact = await this.prismaRepository.contact.findFirst({
             where: { remoteJid: received.key.remoteJid, instanceId: this.instanceId },
+            select: { profilePicUrl: true },
           });
 
           const contactRaw: {
@@ -1638,7 +1682,7 @@ export class BaileysStartupService extends ChannelStartupService {
           } = {
             remoteJid: received.key.remoteJid,
             pushName: received.key.fromMe ? '' : received.key.fromMe == null ? '' : received.pushName,
-            profilePicUrl: (await this.profilePicture(received.key.remoteJid)).profilePictureUrl,
+            profilePicUrl: await this.resolveProfilePictureUrl(received.key.remoteJid, contact?.profilePicUrl, false),
             instanceId: this.instanceId,
           };
           const webhookContactRaw: NormalizedWebhookContact = {
@@ -1714,7 +1758,6 @@ export class BaileysStartupService extends ChannelStartupService {
         const cached = await this.baileysCache.get(updateKey);
 
         const secondsSinceEpoch = Math.floor(Date.now() / 1000);
-        console.log('CACHE:', { cached, updateKey, messageTimestamp: update.messageTimestamp, secondsSinceEpoch });
 
         if (
           (update.messageTimestamp && update.messageTimestamp === cached) ||
@@ -1881,7 +1924,7 @@ export class BaileysStartupService extends ChannelStartupService {
               try {
                 await this.prismaRepository.chat.update({ where: { id: existingChat.id }, data: chatToInsert });
               } catch {
-                console.log(`Chat insert record ignored: ${chatToInsert.remoteJid} - ${chatToInsert.instanceId}`);
+                this.logger.debug(`Chat insert record ignored: ${chatToInsert.remoteJid} - ${chatToInsert.instanceId}`);
               }
             }
           }
@@ -2248,6 +2291,66 @@ export class BaileysStartupService extends ChannelStartupService {
       (this.localSettings.syncFullHistory && msg?.syncType === 2) ||
       (!this.localSettings.syncFullHistory && msg?.syncType === 3)
     );
+  }
+
+  private async getStoredProfilePictureMap(remoteJids: string[]) {
+    const normalizedRemoteJids = [...new Set(remoteJids.filter(Boolean).map((remoteJid) => createJid(remoteJid)))];
+
+    if (!normalizedRemoteJids.length) {
+      return new Map<string, string | null>();
+    }
+
+    const storedContacts = await this.prismaRepository.contact.findMany({
+      where: {
+        instanceId: this.instanceId,
+        remoteJid: { in: normalizedRemoteJids },
+      },
+      select: {
+        remoteJid: true,
+        profilePicUrl: true,
+      },
+    });
+
+    const storedProfilePictures = new Map<string, string | null>();
+
+    for (const contact of storedContacts) {
+      const cacheKey = createJid(contact.remoteJid);
+
+      storedProfilePictures.set(cacheKey, contact.profilePicUrl);
+      this.profilePictureCache.set(cacheKey, contact.profilePicUrl ?? null);
+    }
+
+    return storedProfilePictures;
+  }
+
+  private async resolveProfilePictureUrl(remoteJid: string, storedProfilePicUrl?: string | null, allowFetch = true) {
+    const cacheKey = createJid(remoteJid);
+    const cachedProfilePicUrl = this.profilePictureCache.get<string | null>(cacheKey);
+
+    if (cachedProfilePicUrl !== undefined) {
+      return cachedProfilePicUrl;
+    }
+
+    if (storedProfilePicUrl !== undefined) {
+      const normalizedStoredProfilePicUrl = storedProfilePicUrl ?? null;
+
+      this.profilePictureCache.set(cacheKey, normalizedStoredProfilePicUrl);
+
+      if (normalizedStoredProfilePicUrl !== null || !allowFetch) {
+        return normalizedStoredProfilePicUrl;
+      }
+    }
+
+    if (!allowFetch) {
+      return null;
+    }
+
+    const profilePicture = await this.profilePicture(cacheKey);
+    const profilePictureUrl = profilePicture.profilePictureUrl ?? null;
+
+    this.profilePictureCache.set(cacheKey, profilePictureUrl);
+
+    return profilePictureUrl;
   }
 
   public async profilePicture(number: string) {
@@ -3142,7 +3245,7 @@ export class BaileysStartupService extends ChannelStartupService {
         return await sharp(imageBuffer).webp().toBuffer();
       }
     } catch (error) {
-      console.error('Erro ao converter a imagem para WebP:', error);
+      this.logger.error(['Erro ao converter a imagem para WebP:', error]);
       throw error;
     }
   }
@@ -3282,7 +3385,7 @@ export class BaileysStartupService extends ChannelStartupService {
       });
 
       ffmpegProcess.on('error', (error) => {
-        console.error('Error in ffmpeg process', error);
+        this.logger.error(['Error in ffmpeg process', error]);
         reject(error);
       });
 
@@ -3301,7 +3404,7 @@ export class BaileysStartupService extends ChannelStartupService {
       inputStream.pipe(ffmpegProcess.stdin);
 
       inputStream.on('error', (err) => {
-        console.error('Error in inputStream', err);
+        this.logger.error(['Error in inputStream', err]);
         ffmpegProcess.stdin.end();
         reject(err);
       });
@@ -3362,7 +3465,7 @@ export class BaileysStartupService extends ChannelStartupService {
         });
 
         outputAudioStream.on('error', (error) => {
-          console.log('error', error);
+          this.logger.error(['Error converting audio stream', error]);
           reject(error);
         });
 
@@ -3404,8 +3507,8 @@ export class BaileysStartupService extends ChannelStartupService {
             '0',
           ])
           .pipe(outputAudioStream, { end: true })
-          .on('error', function (error) {
-            console.log('error', error);
+          .on('error', (error) => {
+            this.logger.error(['Error transcoding audio', error]);
             reject(error);
           });
       });
@@ -3418,7 +3521,7 @@ export class BaileysStartupService extends ChannelStartupService {
     if (file?.buffer) {
       mediaData.audio = file.buffer.toString('base64');
     } else if (!isURL(data.audio) && !isBase64(data.audio)) {
-      console.error('Invalid file or audio source');
+      this.logger.error('Invalid file or audio source');
       throw new BadRequestException('File buffer, URL, or base64 audio is required');
     }
 
@@ -4794,7 +4897,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if ((cacheConf?.REDIS?.ENABLED && cacheConf?.REDIS?.URI !== '') || cacheConf?.LOCAL?.ENABLED) {
       if (await groupMetadataCache?.has(groupJid)) {
-        console.log(`Cache request for group: ${groupJid}`);
+        this.logger.debug(`Cache request for group: ${groupJid}`);
         const meta = await groupMetadataCache.get(groupJid);
 
         if (Date.now() - meta.timestamp > 3600000) {
@@ -4804,7 +4907,7 @@ export class BaileysStartupService extends ChannelStartupService {
         return meta.data;
       }
 
-      console.log(`Cache request for group: ${groupJid} - not found`);
+      this.logger.debug(`Cache request for group: ${groupJid} - not found`);
       return await this.updateGroupMetadataCache(groupJid);
     }
 
@@ -5045,7 +5148,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       return { participants: parsedParticipants };
     } catch (error) {
-      console.error(error);
+      this.logger.error(error);
       throw new NotFoundException('No participants', error.toString());
     }
   }
@@ -5352,7 +5455,9 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async baileysSendNode(stanza: any) {
-    console.log('stanza', JSON.stringify(stanza));
+    if (this.logBaileysRaw) {
+      this.logger.debug(`stanza ${JSON.stringify(stanza)}`);
+    }
     const response = await this.client.sendNode(stanza);
 
     return response;
@@ -5436,7 +5541,7 @@ export class BaileysStartupService extends ChannelStartupService {
         catalog: productsCatalog,
       };
     } catch (error) {
-      console.log(error);
+      this.logger.error(error);
       return { wuid: jid, name: null, isBusiness: false };
     }
   }

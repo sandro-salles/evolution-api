@@ -5,6 +5,7 @@
 |------|--------|----------------|-------------------|
 | 2026-03-05 | self | Assumi inicialmente que o campo `lid` já representava o LID real no fluxo `whatsappNumber`, mas ele era usado só como flag literal `'lid'`. | Verificar o contrato completo até o provider e confirmar o significado real de campos opcionais antes de propagar comportamento novo. |
 | 2026-03-05 | self | Tentei validar com `npx tsc` e `npx eslint`, mas o ambiente sem `node_modules` puxou binários globais/incorretos. | Quando o repo estiver sem dependências instaladas, declarar a limitação explicitamente e evitar confiar em `npx` sem toolchain local. |
+| 2026-03-10 | self | Comecei a sessão confiando no `cwd` automático do agente, mas ele apontava para um caminho inexistente e travou `exec_command`/`apply_patch`. | Quando o ambiente vier com `cwd` quebrado, validar o checkout ativo logo no início e usar `workdir` explícito antes de editar. |
 
 ## User Preferences
 - Responder em PT-BR ao explicar mudanças no código.
@@ -20,6 +21,8 @@
 - O cache `IsOnWhatsapp` também precisa receber JIDs sem `:device` e, para entradas em `@lid`, vale tentar resolver PN antes de persistir; caso contrário o registro fica redundante e pouco útil para lookup futuro.
 - Para validar localmente o Evolution alinhado ao runtime do projeto, usar `source ~/.nvm/nvm.sh && nvm use 24` antes de `npm install`/`npm run build`.
 - Quando houver delay em `messages.upsert`/`messages.update`, vale distinguir starvation por `status@broadcast` de lentidão real do handler: ignorar `status@broadcast` no Baileys e medir `queueDelayMs` no `ev.process()` ajuda a separar as duas causas.
+- Para reduzir latência sem arriscar regressão, preferir cortar I/O redundante do hot path primeiro: `findSettings()` com TTL curto e `profilePicture()` reaproveitando DB/cache antes de chamar a rede.
+- Em `messages.upsert`, foto de perfil não precisa justificar round-trip ao WhatsApp; usar o valor persistido/cacheado e deixar refresh remoto para `contacts.*`.
 
 ## Patterns That Don't Work
 - Inferir APIs do Baileys sem abrir o código-fonte local quando há integrações específicas como `lidMapping`.
