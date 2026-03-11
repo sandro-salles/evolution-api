@@ -2609,7 +2609,7 @@ export class BaileysStartupService extends ChannelStartupService {
       throw new BadRequestException(isWA);
     }
 
-    const sender = isWA.jid.toLowerCase();
+    const sender = this.resolveOutboundJid(number, isWA);
 
     this.logger.verbose(`Sending message to ${sender}`);
 
@@ -2884,7 +2884,7 @@ export class BaileysStartupService extends ChannelStartupService {
         throw new BadRequestException(isWA);
       }
 
-      const sender = isWA.jid;
+      const sender = this.resolveOutboundJid(number, isWA);
 
       if (data?.delay && data?.delay > 20000) {
         let remainingDelay = data?.delay;
@@ -3827,6 +3827,16 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private isLidAddress(jid: string | null | undefined) {
     return !!jid && /@(hosted\.)?lid$/.test(jid);
+  }
+
+  private resolveOutboundJid(requestedNumber: string, isWA: OnWhatsAppDto) {
+    const normalizedRequestedJid = (this.normalizeWebhookJid(requestedNumber) || requestedNumber).toLowerCase();
+
+    if (this.isLidAddress(normalizedRequestedJid)) {
+      return normalizedRequestedJid;
+    }
+
+    return isWA.jid.toLowerCase();
   }
 
   private inferWebhookAddressingMode(key: Pick<NormalizedWebhookMessageKey, 'remoteJid' | 'participant'>) {

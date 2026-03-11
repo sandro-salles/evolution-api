@@ -1,25 +1,64 @@
-# Theory: Contrato Estável Para Fora, Hot Path Leve Para Dentro
+# Theory: Preserve LID in Evolution Outbound Send Path
 
 ## Problem
 
-Os sintomas recentes se dividiram em dois grupos, mas com a mesma raiz operacional: o Evolution está servindo como boundary entre um provider complexo e um consumidor que precisa de contratos previsíveis e latência baixa. De um lado, havia inconsistências no contrato externo de `onWhatsapp` e dos webhooks, especialmente em torno de `lid`, `remoteJidAlt` e `addressingMode`. Do outro, apareceram atrasos intermitentes em `messages.upsert` e `messages.update`, sugerindo que o problema não era apenas o socket do Baileys, mas também trabalho evitável dentro da fila serial do próprio Evolution.
+O contrato externo entre Contact-Z e Evolution passou a carregar corretamente
+`remoteJid`, `remoteJidAlt` e `addressingMode` para contatos WhatsApp com LID.
+Mesmo assim, respostas humanas continuaram saindo em `pn` em casos concretos de
+produção. O risco aqui não é apenas cosmético no webhook de `send.message`; é a
+possibilidade de o endereço efetivo do envio divergir da preferência persistida
+da sessão.
 
 ## Operating Theory
 
-O ajuste seguro precisa continuar separando duas responsabilidades. O contrato externo deve ser estabilizado no boundary de emissão, porque alterar o objeto interno principal aumentaria o risco de regressão em cache, persistência e chatbot. Já o ganho de desempenho mais seguro não vem de paralelizar o mundo inteiro de uma vez, mas de cortar I/O redundante e serialização desnecessária do hot path. Como a fila de `ev.process()` é única, qualquer trabalho evitável dentro de `messages.upsert`, `messages.update` ou `contacts.*` se propaga para todo o sistema.
+O `service` já estava enviando o JID correto. Em produção, a sessão analisada
+estava com `preferred_external_id = ...@lid`, e os logs do Evolution mostraram:
+
+- `Number ...@lid found in cache`
+- `Sending message to ...@s.whatsapp.net`
+
+Isso desloca a causa para dentro do Evolution. O send path usa
+`sendMessageWithTyping(number, ...)`, que primeiro chama `whatsappNumber()` e
+depois usa `isWA.jid` como destino real. Quando há cache hit para um contato com
+LID resolvido, `whatsappNumber()` devolve `cached.remoteJid` como `jid`, e esse
+campo hoje guarda o PN (`@s.whatsapp.net`). O LID permanece em `lid`, mas deixa
+de ser o endereço efetivo do envio.
 
 ## Strategy
 
-A linha adotada agora é incremental e conservadora. No lado de contrato, `lid` continua exposto como LID base do usuário, sem `:device`, e os webhooks seguem normalizados para sempre expor `remoteJid`, `remoteJidAlt`, `participant`, `participantAlt` e `addressingMode` quando o evento é de mensagem, além do trio `remoteJid`, `remoteJidAlt` e `addressingMode` em `contacts.update`. No lado de performance, os ganhos seguros vieram de três cortes: cache curto de `findSettings()` para evitar leitura de banco a cada batch, remoção de `console.log/error` do caminho quente e retirada do fetch remoto de avatar do fluxo síncrono de `messages.upsert`, reaproveitando DB e cache local sempre que possível.
+A correção deve ser cirúrgica. `whatsappNumber()` continua útil para verificar
+existência do contato e recuperar metadados, então a mudança mais segura é no
+consumo do resultado, não no contrato global do helper.
+
+O princípio é:
+
+- se o caller pediu explicitamente um `@lid`, o send path deve preservar esse
+  LID como destino real;
+- se o caller pediu `@s.whatsapp.net`, o comportamento atual permanece;
+- presença (`sendPresence`) deve seguir a mesma regra para não reintroduzir
+  inconsistência entre typing/presence e envio.
 
 ## Key Discoveries
 
-Os logs e a leitura do código confirmaram que o gargalo principal continua no hot path do Evolution, não no webhook em si. `findSettings()` fazia `findUnique` em todo batch do `ev.process()`, o que é desnecessário quando as settings mudam raramente e já são refletidas em `localSettings`. Em paralelo, `profilePicture()` era chamado em `messages.upsert` para praticamente toda mensagem recebida e também em `contacts.upsert`/`contacts.update`, o que transforma um metadata opcional em dependência síncrona de rede. A correção aplicada foi deixar `messages.upsert` usar apenas `profilePicUrl` já persistido ou em cache, e fazer `contacts.*` buscar foto remota só quando não houver `imgUrl` explícito nem valor reaproveitável do banco/cache. Isso reduz round-trips sem mudar o contrato externo. Também ficou claro que `console.log` no meio do handler custa mais do que parece num fluxo serial, porque força serialização extra mesmo quando não há valor operacional real naquele log.
+O cache de on-whatsapp foi desenhado para manter mapeamento entre PN e LID, mas
+o send path passou a tratá-lo como autoridade para o endereço final. Esse é o
+desvio. O helper ainda serve para validar existência, porém não deve rebaixar o
+addressing mode escolhido pelo caller. A correção precisa preservar o LID só no
+outbound explícito, evitando alterar outros consumidores de `whatsappNumber()`
+como bloqueio, labels, profile e catálogos, que podem continuar dependendo do
+PN resolvido.
 
-## Event Backpressure
-
-A hipótese de starvation por `status@broadcast` continua válida e foi tratada no fork do Baileys via `ignoreStatusBroadcast`, mas isso sozinho não resolve o atraso quando o próprio handler do Evolution carrega I/O desnecessário. Por isso a leitura correta agora é combinada: há otimizações no Baileys que aliviam a entrada, e há otimizações no Evolution que reduzem o tempo de serviço por batch. A telemetria opcional adicionada em `ev.process()` continua sendo a melhor ferramenta para diferenciar atraso de ingresso, fila saturada e trabalho excessivo dentro do handler.
+O patch aplicado segue exatamente essa linha: um helper local resolve o JID
+outbound preservando `@lid` quando ele já veio explícito no argumento original,
+e `sendMessageWithTyping`/`sendPresence` passaram a usar esse helper no lugar de
+`isWA.jid` diretamente. A validação com `npm run build` passou, o que aumenta a
+confiança de que o ajuste está isolado ao hot path de envio sem quebrar
+tipagem nem bundle.
 
 ## Open Questions
 
-Ainda resta trabalho estrutural maior, como separar melhor histórico de tempo real ou revisar a fila única por tipo de evento, mas esses passos têm risco mais alto. O corte implementado nesta rodada foi deliberadamente menor e mais seguro: reduzir I/O redundante no hot path sem alterar a semântica de persistência, sem mexer em `saveCreds()` e sem introduzir concorrência nova em pontos críticos.
+- Pode haver outros fluxos outbound além de `sendMessageWithTyping` e
+  `sendPresence` que também precisem preservar LID explicitamente.
+- Depois do patch, vale validar se o webhook de `send.message` passa a refletir
+  `remoteJid = ...@lid` e `addressingMode = lid` como esperado, sem regressão em
+  números puramente PN.
